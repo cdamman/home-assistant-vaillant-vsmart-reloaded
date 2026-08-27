@@ -52,9 +52,17 @@ FORBIDDEN_OPERATION_ERROR = 13
 # "manual", so returning a room to its schedule has to be posted here directly.
 SET_STATE_PATH = "syncapi/v1/setstate"
 
+# Endpoint of the home wide modes, away among them.
+SET_THERM_MODE_PATH = "api/setthermmode"
+
 # Setpoint mode which makes a room follow its schedule again. Same value as the
 # one the Netatmo integration of Home Assistant uses to leave a manual boost.
 SETPOINT_MODE_SCHEDULE = "home"
+
+# Home modes. Beware of the asymmetry with the room setpoint above: following
+# the schedule is "home" for a room but "schedule" for the home.
+HOME_MODE_AWAY = "away"
+HOME_MODE_SCHEDULE = "schedule"
 
 RESPONSE_STATUS_OK = "ok"
 
@@ -80,12 +88,6 @@ def _netatmo_error_code(ex: ApiException) -> int | None:
         return json.loads(response["body"])["error"]["code"]
     except (KeyError, TypeError, ValueError):
         return None
-
-
-def _still_wanted(value, until) -> bool:
-    """Return whether a requested value is set and still worth showing."""
-
-    return value is not None and until is not None and dt_util.utcnow() < until
 
 
 def _api_error(action: str, ex: ApiException) -> HomeAssistantError:
@@ -126,10 +128,8 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
         self._home_id = None
         self._room_id = None
 
-        self._optimistic_target_temperature = None
-        self._optimistic_target_temperature_until = None
-        self._optimistic_hvac_mode = None
-        self._optimistic_hvac_mode_until = None
+        # Values asked for by the user, with the moment they stop being shown.
+        self._optimistic = {}
 
     @property
     def name(self) -> str:
@@ -169,13 +169,9 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
     def target_temperature(self) -> float:
         """Return the targeted room temperature."""
 
-        if _still_wanted(
-            self._optimistic_target_temperature,
-            self._optimistic_target_temperature_until,
-        ):
-            return self._optimistic_target_temperature
+        requested = self._requested("target_temperature")
 
-        return self._reported_target_temperature
+        return self._reported_target_temperature if requested is None else requested
 
     @property
     def hvac_action(self) -> HVACAction:
@@ -215,10 +211,9 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
     def hvac_mode(self) -> HVACMode:
         """Return currently selected HVAC operation mode."""
 
-        if _still_wanted(self._optimistic_hvac_mode, self._optimistic_hvac_mode_until):
-            return self._optimistic_hvac_mode
+        requested = self._requested("hvac_mode")
 
-        return self._reported_hvac_mode
+        return self._reported_hvac_mode if requested is None else requested
 
     @property
     def preset_modes(self) -> list[str]:
@@ -227,61 +222,69 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
         return SUPPORTED_PRESET_MODES
 
     @property
-    def preset_mode(self) -> str:
-        """Return the currently selected HVAC preset mode."""
+    def _reported_preset_mode(self) -> str:
+        """Return the preset mode as reported by the API.
+
+        Away set on the home is no more visible here than a manual setpoint set
+        on the room, for the same reason.
+        """
 
         if self._module.setpoint_away.setpoint_activate:
             return PRESET_AWAY
 
         return PRESET_NONE
 
-    def _show_requested(
-        self,
-        target_temperature: float | None = None,
-        hvac_mode: HVACMode | None = None,
-    ) -> None:
-        """Show a requested value until the API catches up with it.
+    @property
+    def preset_mode(self) -> str:
+        """Return the currently selected HVAC preset mode."""
 
-        The two values are tracked apart because they are not confirmed the
-        same way. A target temperature shows up in the polled data, so it can
-        be handed back to the API as soon as it matches. An operation mode set
-        on the room never appears there, so it can only be shown for a while.
-        """
+        requested = self._requested("preset_mode")
+
+        return self._reported_preset_mode if requested is None else requested
+
+    def _requested(self, name: str):
+        """Return the value asked for by the user, while it is worth showing."""
+
+        value, until = self._optimistic.get(name, (None, None))
+
+        if until is None or dt_util.utcnow() >= until:
+            return None
+
+        return value
+
+    def _show_requested(self, **values) -> None:
+        """Show requested values until the API catches up with them."""
 
         deadline = dt_util.utcnow() + OPTIMISTIC_TIMEOUT
 
-        if target_temperature is not None:
-            self._optimistic_target_temperature = target_temperature
-            self._optimistic_target_temperature_until = deadline
-
-        if hvac_mode is not None:
-            self._optimistic_hvac_mode = hvac_mode
-            self._optimistic_hvac_mode_until = deadline
+        for name, value in values.items():
+            if value is not None:
+                self._optimistic[name] = (value, deadline)
 
         self.async_write_ha_state()
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Drop a requested value once the API agrees with it, or times out."""
+        """Drop a requested value once the API agrees with it, or it times out.
 
-        if self._optimistic_target_temperature is not None and (
-            self._reported_target_temperature == self._optimistic_target_temperature
-            or not _still_wanted(
-                self._optimistic_target_temperature,
-                self._optimistic_target_temperature_until,
-            )
-        ):
-            self._optimistic_target_temperature = None
-            self._optimistic_target_temperature_until = None
+        Each value is followed on its own because they are not confirmed the
+        same way. A target temperature shows up in the polled data, so it can
+        be handed back to the API as soon as it matches. An operation mode set
+        on the room and an away preset set on the home never appear there, so
+        they are only shown until their deadline.
+        """
 
-        if self._optimistic_hvac_mode is not None and (
-            self._reported_hvac_mode == self._optimistic_hvac_mode
-            or not _still_wanted(
-                self._optimistic_hvac_mode, self._optimistic_hvac_mode_until
-            )
-        ):
-            self._optimistic_hvac_mode = None
-            self._optimistic_hvac_mode_until = None
+        now = dt_util.utcnow()
+
+        reported = {
+            "target_temperature": self._reported_target_temperature,
+            "hvac_mode": self._reported_hvac_mode,
+            "preset_mode": self._reported_preset_mode,
+        }
+
+        for name, (value, until) in list(self._optimistic.items()):
+            if value == reported.get(name) or now >= until:
+                del self._optimistic[name]
 
         super()._handle_coordinator_update()
 
@@ -384,31 +387,40 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
 
         self._refresh_soon()
 
+    async def _async_set_home_mode(self, mode: str, action: str) -> None:
+        """Set the mode of the whole home.
+
+        Away is a mode of the home, not a setpoint of the room, so it goes to
+        its own endpoint. The API client has no method for it, so the call is
+        posted directly, same as the room schedule one.
+        """
+
+        home_id, _ = await self._async_home_and_room_ids()
+
+        try:
+            body = await self._client._post(
+                SET_THERM_MODE_PATH,
+                data={"home_id": home_id, "mode": mode},
+            )
+        except ApiException as ex:
+            raise _api_error(action, ex) from ex
+
+        if body.get("status") != RESPONSE_STATUS_OK:
+            raise HomeAssistantError(f"Vaillant refused to {action}: {body}")
+
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Select new HVAC preset mode."""
 
         _LOGGER.debug("Setting HVAC preset mode to: %s", preset_mode)
 
         if preset_mode == PRESET_AWAY:
-            try:
-                await self._client.async_set_minor_mode(
-                    self._device_id,
-                    self._module_id,
-                    SetpointMode.AWAY,
-                    True,
-                )
-            except ApiException as ex:
-                raise _api_error("switch to away mode", ex) from ex
+            await self._async_set_home_mode(HOME_MODE_AWAY, "switch to away mode")
         elif preset_mode == PRESET_NONE:
-            try:
-                await self._client.async_set_minor_mode(
-                    self._device_id,
-                    self._module_id,
-                    SetpointMode.AWAY,
-                    False,
-                )
-            except ApiException as ex:
-                raise _api_error("cancel away mode", ex) from ex
+            await self._async_set_home_mode(HOME_MODE_SCHEDULE, "cancel away mode")
+        else:
+            raise HomeAssistantError(f"Unsupported preset mode: {preset_mode}")
+
+        self._show_requested(preset_mode=preset_mode)
 
         self._refresh_soon()
 
