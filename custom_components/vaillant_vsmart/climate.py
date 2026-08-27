@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
 import logging
 
 from homeassistant.components.climate import ClimateEntity
@@ -15,6 +16,7 @@ from homeassistant.components.climate.const import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from vaillant_netatmo_api import ApiException, SetpointMode, SystemMode
 
@@ -26,6 +28,37 @@ from .entity import VaillantCoordinator, VaillantModuleEntity
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TEMPERATURE_INCREASE = 1
+
+# Netatmo error code returned when the thermostat refuses an operation, for
+# instance when asked to cancel a setpoint which is not active. The API answers
+# it with a 403, which the API client reports as an expired access token.
+FORBIDDEN_OPERATION_ERROR = 13
+
+
+def _netatmo_error_code(ex: ApiException) -> int | None:
+    """Return the error code carried by an API error response, if any."""
+
+    response = getattr(ex, "response", None)
+
+    if not response:
+        return None
+
+    try:
+        return json.loads(response["body"])["error"]["code"]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _api_error(action: str, ex: ApiException) -> HomeAssistantError:
+    """Turn an API exception into an error which can be shown to the user."""
+
+    if _netatmo_error_code(ex) == FORBIDDEN_OPERATION_ERROR:
+        return HomeAssistantError(
+            f"Vaillant refused to {action}. The thermostat does not accept this "
+            "change in its current system mode."
+        )
+
+    return HomeAssistantError(f"Error while trying to {action}: {ex}")
 
 SUPPORTED_FEATURES = (
     ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
@@ -151,7 +184,7 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
                     setpoint_temp=new_temperature,
                 )
             except ApiException as ex:
-                _LOGGER.exception(ex)
+                raise _api_error("switch to heat mode", ex) from ex
         elif hvac_mode == HVACMode.AUTO:
             try:
                 await self._client.async_set_minor_mode(
@@ -161,7 +194,15 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
                     False,
                 )
             except ApiException as ex:
-                _LOGGER.exception(ex)
+                # Cancelling a manual setpoint which is not active is refused
+                # by the API, and the thermostat is then already in the
+                # requested state. The state of the setpoint cannot be checked
+                # up front: a setpoint placed through the room API does not
+                # show up in the module data this integration polls.
+                if _netatmo_error_code(ex) != FORBIDDEN_OPERATION_ERROR:
+                    raise _api_error("switch to auto mode", ex) from ex
+
+                _LOGGER.debug("No manual setpoint to cancel: %s", ex)
 
         await self.coordinator.async_request_refresh()
 
@@ -179,7 +220,7 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
                     True,
                 )
             except ApiException as ex:
-                _LOGGER.exception(ex)
+                raise _api_error("switch to away mode", ex) from ex
         elif preset_mode == PRESET_NONE:
             try:
                 await self._client.async_set_minor_mode(
@@ -189,7 +230,12 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
                     False,
                 )
             except ApiException as ex:
-                _LOGGER.exception(ex)
+                # Same as for the manual setpoint: cancelling an away setpoint
+                # which is not active is refused, and already the wanted state.
+                if _netatmo_error_code(ex) != FORBIDDEN_OPERATION_ERROR:
+                    raise _api_error("cancel away mode", ex) from ex
+
+                _LOGGER.debug("No away setpoint to cancel: %s", ex)
 
         await self.coordinator.async_request_refresh()
 
@@ -207,9 +253,8 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
             try:
                 _LOGGER.debug("set_temperature calling get_home_data") 
                 homes_get_data = await self._client.async_get_home_data() 
-            except ApiException as ex: 
-                _LOGGER.error("Failed to fetch Vaillant home data: %s", ex) 
-                return 
+            except ApiException as ex:
+                raise _api_error("fetch the home data", ex) from ex
 
         if len(homes_get_data)==1:
             _HOME_ID = homes_get_data[0].home_id
@@ -239,6 +284,6 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
                 setpoint_temp=new_temperature,
             )
         except ApiException as ex:
-            _LOGGER.exception(ex)
+            raise _api_error("set the target temperature", ex) from ex
 
         await self.coordinator.async_request_refresh()
