@@ -15,8 +15,14 @@ from homeassistant.components.climate.const import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from vaillant_netatmo_api import ApiException, SetpointMode, SystemMode
+from vaillant_netatmo_api import (
+    ApiException,
+    RequestUnauthorizedException,
+    SetpointMode,
+    SystemMode,
+)
 
 from .const import (
     DOMAIN,
@@ -24,6 +30,22 @@ from .const import (
 from .entity import VaillantCoordinator, VaillantModuleEntity
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _api_error(action: str, ex: ApiException) -> HomeAssistantError:
+    """Turn an API exception into an error which can be shown to the user."""
+
+    if isinstance(ex, RequestUnauthorizedException):
+        # The API client reports every 403 as an expired token, but the
+        # thermostat also answers 403 ("Operation is forbidden") when it
+        # refuses a change in its current state, for instance while the
+        # system is in summer or frost guard mode.
+        return HomeAssistantError(
+            f"Vaillant refused to {action}. The thermostat may not accept this "
+            "change in its current system mode, or the credentials expired."
+        )
+
+    return HomeAssistantError(f"Error while trying to {action}: {ex}")
 
 DEFAULT_TEMPERATURE_INCREASE = 1
 
@@ -151,8 +173,13 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
                     setpoint_temp=new_temperature,
                 )
             except ApiException as ex:
-                _LOGGER.exception(ex)
+                raise _api_error("switch to heat mode", ex) from ex
         elif hvac_mode == HVACMode.AUTO:
+            # Deactivating a manual setpoint which is not active is refused by
+            # the API, so only send the call when there is one to cancel.
+            if not self._module.setpoint_manual.setpoint_activate:
+                return
+
             try:
                 await self._client.async_set_minor_mode(
                     self._device_id,
@@ -161,7 +188,7 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
                     False,
                 )
             except ApiException as ex:
-                _LOGGER.exception(ex)
+                raise _api_error("switch to auto mode", ex) from ex
 
         await self.coordinator.async_request_refresh()
 
@@ -179,8 +206,13 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
                     True,
                 )
             except ApiException as ex:
-                _LOGGER.exception(ex)
+                raise _api_error("switch to away mode", ex) from ex
         elif preset_mode == PRESET_NONE:
+            # Same as for the manual setpoint: the API refuses to deactivate an
+            # away setpoint which is not active.
+            if not self._module.setpoint_away.setpoint_activate:
+                return
+
             try:
                 await self._client.async_set_minor_mode(
                     self._device_id,
@@ -189,7 +221,7 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
                     False,
                 )
             except ApiException as ex:
-                _LOGGER.exception(ex)
+                raise _api_error("cancel away mode", ex) from ex
 
         await self.coordinator.async_request_refresh()
 
@@ -205,11 +237,10 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
 
         if len(homes_get_data)==0:
             try:
-                _LOGGER.debug("set_temperature calling get_home_data") 
-                homes_get_data = await self._client.async_get_home_data() 
-            except ApiException as ex: 
-                _LOGGER.error("Failed to fetch Vaillant home data: %s", ex) 
-                return 
+                _LOGGER.debug("set_temperature calling get_home_data")
+                homes_get_data = await self._client.async_get_home_data()
+            except ApiException as ex:
+                raise _api_error("fetch the home data", ex) from ex
 
         if len(homes_get_data)==1:
             _HOME_ID = homes_get_data[0].home_id
@@ -239,6 +270,6 @@ class VaillantClimate(VaillantModuleEntity, ClimateEntity):
                 setpoint_temp=new_temperature,
             )
         except ApiException as ex:
-            _LOGGER.exception(ex)
+            raise _api_error("set the target temperature", ex) from ex
 
         await self.coordinator.async_request_refresh()
